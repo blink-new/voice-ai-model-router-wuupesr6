@@ -1,0 +1,802 @@
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { blink } from './blink/client'
+import { Button } from './components/ui/button'
+import { Card } from './components/ui/card'
+import { Badge } from './components/ui/badge'
+import { Mic, MicOff, Volume2, VolumeX, Settings, MessageCircle, Pause, Play } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
+
+interface Message {
+  id: string
+  type: 'user' | 'assistant'
+  content: string
+  model?: string
+  timestamp: Date
+  audioUrl?: string
+  isStreaming?: boolean
+}
+
+interface ConversationState {
+  isListening: boolean
+  isProcessing: boolean
+  isSpeaking: boolean
+  isUserSpeaking: boolean
+  canInterrupt: boolean
+  currentAudio: HTMLAudioElement | null
+  audioLevel: number
+}
+
+function App() {
+  const [user, setUser] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [conversationState, setConversationState] = useState<ConversationState>({
+    isListening: false,
+    isProcessing: false,
+    isSpeaking: false,
+    isUserSpeaking: false,
+    canInterrupt: false,
+    currentAudio: null,
+    audioLevel: 0
+  })
+  const [selectedModel, setSelectedModel] = useState<string>('auto')
+  const [showSettings, setShowSettings] = useState(false)
+  const [conversationActive, setConversationActive] = useState(false)
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const vadTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+
+  // Auth state management
+  useEffect(() => {
+    const unsubscribe = blink.auth.onAuthStateChanged((state) => {
+      setUser(state.user)
+      setLoading(state.isLoading)
+    })
+    return unsubscribe
+  }, [])
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopConversation()
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const setupAudioAnalysis = useCallback(async (stream: MediaStream) => {
+    try {
+      console.log('Setting up audio analysis...')
+      
+      // Resume audio context if it's suspended (required by some browsers)
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+      
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume()
+      }
+      
+      analyserRef.current = audioContextRef.current.createAnalyser()
+      const source = audioContextRef.current.createMediaStreamSource(stream)
+      
+      analyserRef.current.fftSize = 256
+      analyserRef.current.smoothingTimeConstant = 0.8
+      source.connect(analyserRef.current)
+      
+      const bufferLength = analyserRef.current.frequencyBinCount
+      const dataArray = new Uint8Array(bufferLength)
+      
+      console.log('Audio analysis setup complete')
+      
+      const updateAudioLevel = () => {
+        if (!analyserRef.current || !conversationActive) return
+        
+        analyserRef.current.getByteFrequencyData(dataArray)
+        const average = dataArray.reduce((a, b) => a + b) / bufferLength
+        const normalizedLevel = Math.min(average / 128, 1)
+        
+        setConversationState(prev => {
+          const isUserCurrentlySpeaking = normalizedLevel > 0.15 // Slightly higher threshold
+          
+          if (isUserCurrentlySpeaking && !prev.isUserSpeaking) {
+            console.log('User started speaking, level:', normalizedLevel)
+            // Clear any existing timeout
+            if (silenceTimeoutRef.current) {
+              clearTimeout(silenceTimeoutRef.current)
+              silenceTimeoutRef.current = null
+            }
+            
+            // If AI is speaking, interrupt it
+            if (prev.isSpeaking && prev.canInterrupt && prev.currentAudio) {
+              console.log('Interrupting AI speech')
+              prev.currentAudio.pause()
+              return {
+                ...prev,
+                audioLevel: normalizedLevel,
+                isUserSpeaking: true,
+                isSpeaking: false,
+                canInterrupt: false,
+                currentAudio: null
+              }
+            }
+            
+            return { ...prev, audioLevel: normalizedLevel, isUserSpeaking: true }
+          } else if (!isUserCurrentlySpeaking && prev.isUserSpeaking) {
+            console.log('User stopped speaking, starting silence timer')
+            // User stopped speaking, start silence detection
+            if (silenceTimeoutRef.current) {
+              clearTimeout(silenceTimeoutRef.current)
+            }
+            
+            silenceTimeoutRef.current = setTimeout(() => {
+              console.log('Silence detected, processing recording')
+              setConversationState(prevState => ({ ...prevState, isUserSpeaking: false }))
+              if (conversationActive && !prev.isProcessing) {
+                processCurrentRecording()
+              }
+            }, 1500) // 1.5 seconds of silence before processing
+            
+            return { ...prev, audioLevel: normalizedLevel }
+          }
+          
+          return { ...prev, audioLevel: normalizedLevel }
+        })
+        
+        if (conversationActive) {
+          requestAnimationFrame(updateAudioLevel)
+        }
+      }
+      
+      updateAudioLevel()
+    } catch (error) {
+      console.error('Error setting up audio analysis:', error)
+      alert('Error setting up audio analysis. Voice detection may not work properly.')
+    }
+  }, [conversationActive]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const startConversation = async () => {
+    try {
+      // Check if browser supports required APIs
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('Your browser does not support voice recording. Please use a modern browser like Chrome, Firefox, or Safari.')
+        return
+      }
+
+      console.log('Requesting microphone access...')
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 44100
+        }
+      })
+      
+      console.log('Microphone access granted')
+      streamRef.current = stream
+      
+      // Check supported MIME types and use the best available
+      let mimeType = 'audio/webm;codecs=opus'
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = 'audio/webm'
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'audio/mp4'
+          if (!MediaRecorder.isTypeSupported(mimeType)) {
+            mimeType = 'audio/wav'
+          }
+        }
+      }
+      
+      console.log('Using MIME type:', mimeType)
+      
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: mimeType
+      })
+      mediaRecorderRef.current = mediaRecorder
+      audioChunksRef.current = []
+
+      mediaRecorder.ondataavailable = (event) => {
+        console.log('Audio data available, size:', event.data.size)
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data)
+        }
+      }
+
+      mediaRecorder.onstart = () => {
+        console.log('MediaRecorder started')
+      }
+
+      mediaRecorder.onerror = (event) => {
+        console.error('MediaRecorder error:', event)
+      }
+
+      mediaRecorder.start(100) // Collect data every 100ms for continuous recording
+      
+      setConversationActive(true)
+      setConversationState(prev => ({ 
+        ...prev, 
+        isListening: true,
+        isUserSpeaking: false,
+        audioLevel: 0
+      }))
+      
+      await setupAudioAnalysis(stream)
+      
+    } catch (error) {
+      console.error('Error starting conversation:', error)
+      if (error.name === 'NotAllowedError') {
+        alert('Microphone access denied. Please allow microphone access and try again.')
+      } else if (error.name === 'NotFoundError') {
+        alert('No microphone found. Please connect a microphone and try again.')
+      } else {
+        alert('Error accessing microphone: ' + error.message)
+      }
+    }
+  }
+
+  const stopConversation = () => {
+    setConversationActive(false)
+    
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+    }
+    
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+      streamRef.current = null
+    }
+    
+    if (audioContextRef.current) {
+      audioContextRef.current.close()
+      audioContextRef.current = null
+    }
+    
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current)
+      silenceTimeoutRef.current = null
+    }
+    
+    if (vadTimeoutRef.current) {
+      clearTimeout(vadTimeoutRef.current)
+      vadTimeoutRef.current = null
+    }
+    
+    if (conversationState.currentAudio) {
+      conversationState.currentAudio.pause()
+    }
+    
+    setConversationState({
+      isListening: false,
+      isProcessing: false,
+      isSpeaking: false,
+      isUserSpeaking: false,
+      canInterrupt: false,
+      currentAudio: null,
+      audioLevel: 0
+    })
+  }
+
+  const processCurrentRecording = async () => {
+    if (!mediaRecorderRef.current || conversationState.isProcessing) return
+    
+    setConversationState(prev => ({ ...prev, isProcessing: true }))
+    
+    try {
+      // Get current audio chunks
+      const currentChunks = [...audioChunksRef.current]
+      audioChunksRef.current = [] // Clear for next recording
+      
+      console.log('Processing audio chunks:', currentChunks.length)
+      
+      if (currentChunks.length === 0) {
+        console.log('No audio chunks to process')
+        setConversationState(prev => ({ ...prev, isProcessing: false }))
+        return
+      }
+      
+      // Use the same MIME type that was used for recording
+      let mimeType = 'audio/webm;codecs=opus'
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = 'audio/webm'
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'audio/mp4'
+          if (!MediaRecorder.isTypeSupported(mimeType)) {
+            mimeType = 'audio/wav'
+          }
+        }
+      }
+      
+      const audioBlob = new Blob(currentChunks, { type: mimeType })
+      console.log('Audio blob created, size:', audioBlob.size, 'bytes')
+      
+      if (audioBlob.size < 1000) { // Less than 1KB is probably too short
+        console.log('Audio too short, skipping transcription')
+        setConversationState(prev => ({ ...prev, isProcessing: false }))
+        return
+      }
+      
+      // Convert to base64 for transcription
+      const base64Audio = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => {
+          const dataUrl = reader.result as string
+          const base64Data = dataUrl.split(',')[1]
+          resolve(base64Data)
+        }
+        reader.onerror = reject
+        reader.readAsDataURL(audioBlob)
+      })
+
+      console.log('Transcribing audio...')
+      // Transcribe audio to text
+      const { text } = await blink.ai.transcribeAudio({
+        audio: base64Audio,
+        language: 'en'
+      })
+
+      console.log('Transcription result:', text)
+
+      if (!text.trim()) {
+        console.log('Empty transcription result')
+        setConversationState(prev => ({ ...prev, isProcessing: false }))
+        return
+      }
+
+      // Add user message
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        type: 'user',
+        content: text,
+        timestamp: new Date()
+      }
+      setMessages(prev => [...prev, userMessage])
+
+      // Determine best model and generate response
+      const model = determineOptimalModel(text)
+      
+      let responseText = ''
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        type: 'assistant',
+        content: '',
+        model,
+        timestamp: new Date(),
+        isStreaming: true
+      }
+      
+      setMessages(prev => [...prev, assistantMessage])
+
+      // Build conversation context
+      const conversationHistory = messages.slice(-6).map(msg => ({
+        role: msg.type === 'user' ? 'user' : 'assistant',
+        content: msg.content
+      }))
+      
+      conversationHistory.push({ role: 'user', content: text })
+
+      await blink.ai.streamText(
+        { 
+          messages: conversationHistory,
+          model: model === 'auto' ? 'gpt-4o-mini' : model,
+          maxTokens: 300 // Shorter responses for conversation flow
+        },
+        (chunk) => {
+          responseText += chunk
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMessage.id 
+              ? { ...msg, content: responseText }
+              : msg
+          ))
+        }
+      )
+
+      // Mark streaming as complete
+      setMessages(prev => prev.map(msg => 
+        msg.id === assistantMessage.id 
+          ? { ...msg, isStreaming: false }
+          : msg
+      ))
+
+      // Generate and play speech response
+      const { url: audioUrl } = await blink.ai.generateSpeech({
+        text: responseText,
+        voice: 'nova'
+      })
+
+      setMessages(prev => prev.map(msg => 
+        msg.id === assistantMessage.id 
+          ? { ...msg, audioUrl }
+          : msg
+      ))
+
+      // Auto-play response if conversation is still active
+      if (conversationActive) {
+        await playAudioResponse(audioUrl)
+      }
+
+    } catch (error) {
+      console.error('Error processing audio:', error)
+    } finally {
+      setConversationState(prev => ({ ...prev, isProcessing: false }))
+    }
+  }
+
+  const playAudioResponse = async (audioUrl: string): Promise<void> => {
+    return new Promise((resolve) => {
+      if (conversationState.currentAudio) {
+        conversationState.currentAudio.pause()
+      }
+      
+      const audio = new Audio(audioUrl)
+      
+      audio.onloadstart = () => {
+        setConversationState(prev => ({ 
+          ...prev, 
+          isSpeaking: true, 
+          canInterrupt: true,
+          currentAudio: audio 
+        }))
+      }
+      
+      audio.onended = () => {
+        setConversationState(prev => ({ 
+          ...prev, 
+          isSpeaking: false, 
+          canInterrupt: false,
+          currentAudio: null 
+        }))
+        resolve()
+      }
+      
+      audio.onerror = () => {
+        setConversationState(prev => ({ 
+          ...prev, 
+          isSpeaking: false, 
+          canInterrupt: false,
+          currentAudio: null 
+        }))
+        resolve()
+      }
+      
+      audio.play()
+    })
+  }
+
+  const interruptAI = () => {
+    if (conversationState.currentAudio && conversationState.canInterrupt) {
+      conversationState.currentAudio.pause()
+      setConversationState(prev => ({ 
+        ...prev, 
+        isSpeaking: false, 
+        canInterrupt: false,
+        currentAudio: null 
+      }))
+    }
+  }
+
+  const determineOptimalModel = (prompt: string): string => {
+    if (selectedModel !== 'auto') return selectedModel
+    
+    const lowerPrompt = prompt.toLowerCase()
+    
+    // Code-related queries
+    if (lowerPrompt.includes('code') || lowerPrompt.includes('programming') || 
+        lowerPrompt.includes('function') || lowerPrompt.includes('debug')) {
+      return 'gpt-4o'
+    }
+    
+    // Creative writing
+    if (lowerPrompt.includes('write') || lowerPrompt.includes('story') || 
+        lowerPrompt.includes('creative') || lowerPrompt.includes('poem')) {
+      return 'claude-3-5-sonnet-20241022'
+    }
+    
+    // Analysis and reasoning
+    if (lowerPrompt.includes('analyze') || lowerPrompt.includes('explain') || 
+        lowerPrompt.includes('compare') || lowerPrompt.includes('why')) {
+      return 'gpt-4o'
+    }
+    
+    // Default for conversational queries
+    return 'gpt-4o-mini'
+  }
+
+  const toggleConversation = () => {
+    if (conversationActive) {
+      stopConversation()
+    } else {
+      startConversation()
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500 mx-auto mb-4"></div>
+          <p className="text-slate-400">Loading Voice AI...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <Card className="p-8 text-center bg-slate-800 border-slate-700">
+          <h1 className="text-2xl font-bold text-white mb-4">Voice AI Router</h1>
+          <p className="text-slate-400 mb-6">Please sign in to start your voice conversation</p>
+          <Button onClick={() => blink.auth.login()} className="bg-indigo-600 hover:bg-indigo-700">
+            Sign In
+          </Button>
+        </Card>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-900 flex flex-col">
+      {/* Header */}
+      <header className="border-b border-slate-700 p-4">
+        <div className="max-w-4xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-lg flex items-center justify-center">
+              <MessageCircle className="w-5 h-5 text-white" />
+            </div>
+            <h1 className="text-xl font-semibold text-white">Voice AI Router</h1>
+            {conversationActive && (
+              <Badge variant="secondary" className="bg-green-600 text-white animate-pulse">
+                Live
+              </Badge>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <Badge variant="secondary" className="bg-slate-700 text-slate-300">
+              Model: {selectedModel}
+            </Badge>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowSettings(!showSettings)}
+              className="text-slate-400 hover:text-white"
+            >
+              <Settings className="w-4 h-4" />
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      {/* Settings Panel */}
+      <AnimatePresence>
+        {showSettings && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="border-b border-slate-700 bg-slate-800"
+          >
+            <div className="max-w-4xl mx-auto p-4">
+              <div className="flex items-center gap-4">
+                <label className="text-sm text-slate-400">AI Model:</label>
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="bg-slate-700 border border-slate-600 rounded px-3 py-1 text-white text-sm"
+                  disabled={conversationActive}
+                >
+                  <option value="auto">Auto-Select</option>
+                  <option value="gpt-4o-mini">GPT-4O Mini (Fast)</option>
+                  <option value="gpt-4o">GPT-4O (Balanced)</option>
+                  <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet (Creative)</option>
+                </select>
+                {conversationActive && (
+                  <span className="text-xs text-amber-400">Settings locked during conversation</span>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="max-w-4xl mx-auto space-y-4">
+          {messages.length === 0 && (
+            <div className="text-center py-12">
+              <div className="w-16 h-16 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Mic className="w-8 h-8 text-white" />
+              </div>
+              <h2 className="text-xl font-semibold text-white mb-2">Start a Voice Conversation</h2>
+              <p className="text-slate-400 mb-4">Tap to begin a natural conversation with AI</p>
+              <p className="text-sm text-slate-500">
+                • Speak naturally - no need to tap for each message<br/>
+                • Interrupt the AI anytime by speaking<br/>
+                • Conversation flows automatically
+              </p>
+            </div>
+          )}
+
+          {messages.map((message) => (
+            <motion.div
+              key={message.id}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
+            >
+              <div className={`max-w-[80%] ${message.type === 'user' ? 'bg-indigo-600' : 'bg-slate-700'} rounded-2xl p-4 relative`}>
+                <div className="flex items-start gap-3">
+                  <div className="flex-1">
+                    {message.type === 'assistant' && message.model && (
+                      <Badge variant="outline" className="mb-2 text-xs border-slate-500 text-slate-400">
+                        {message.model}
+                      </Badge>
+                    )}
+                    <p className="text-white whitespace-pre-wrap">
+                      {message.content}
+                      {message.isStreaming && (
+                        <span className="inline-block w-2 h-5 bg-white ml-1 animate-pulse" />
+                      )}
+                    </p>
+                    <p className="text-xs text-slate-300 mt-2">
+                      {message.timestamp.toLocaleTimeString()}
+                    </p>
+                  </div>
+                  {message.type === 'assistant' && message.audioUrl && !message.isStreaming && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => playAudioResponse(message.audioUrl!)}
+                      className="text-slate-400 hover:text-white p-1"
+                    >
+                      <Volume2 className="w-4 h-4" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+      </div>
+
+      {/* Voice Controls */}
+      <div className="border-t border-slate-700 p-6">
+        <div className="max-w-4xl mx-auto flex flex-col items-center">
+          {/* Audio Visualization */}
+          <div className="flex items-center justify-center h-16 mb-4">
+            {conversationActive && (
+              <div className="flex items-center gap-1">
+                {[...Array(7)].map((_, i) => (
+                  <div
+                    key={i}
+                    className={`w-1 rounded-full transition-all duration-100 ${
+                      conversationState.isUserSpeaking 
+                        ? 'bg-indigo-500' 
+                        : conversationState.isSpeaking 
+                        ? 'bg-green-500' 
+                        : 'bg-slate-600'
+                    }`}
+                    style={{ 
+                      height: conversationState.isUserSpeaking 
+                        ? `${Math.max(4, conversationState.audioLevel * 40)}px`
+                        : conversationState.isSpeaking
+                        ? `${4 + Math.sin((Date.now() / 100) + i) * 16}px`
+                        : '4px'
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Status Text */}
+          <div className="text-center mb-4 h-6">
+            {conversationState.isUserSpeaking && (
+              <p className="text-indigo-400 font-medium">Listening to you...</p>
+            )}
+            {conversationState.isProcessing && (
+              <p className="text-amber-400 font-medium">Processing...</p>
+            )}
+            {conversationState.isSpeaking && (
+              <p className="text-green-400 font-medium">AI is speaking...</p>
+            )}
+            {conversationActive && !conversationState.isUserSpeaking && !conversationState.isProcessing && !conversationState.isSpeaking && (
+              <p className="text-slate-400">Waiting for you to speak...</p>
+            )}
+            {!conversationActive && (
+              <p className="text-slate-400">Tap to start conversation</p>
+            )}
+          </div>
+
+          {/* Main Conversation Button */}
+          <div className="relative">
+            {conversationActive && (
+              <div className="absolute inset-0 rounded-full bg-indigo-500 pulse-ring" />
+            )}
+            <Button
+              onClick={toggleConversation}
+              disabled={conversationState.isProcessing}
+              className={`w-20 h-20 rounded-full transition-all duration-300 ${
+                conversationActive
+                  ? 'bg-red-600 hover:bg-red-700 scale-110'
+                  : 'bg-indigo-600 hover:bg-indigo-700'
+              } ${conversationState.isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              {conversationActive ? (
+                <MicOff className="w-8 h-8 text-white" />
+              ) : (
+                <Mic className="w-8 h-8 text-white" />
+              )}
+            </Button>
+          </div>
+
+          {/* Interrupt Button */}
+          {conversationState.isSpeaking && conversationState.canInterrupt && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.8 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.8 }}
+              className="mt-4"
+            >
+              <Button
+                onClick={interruptAI}
+                variant="outline"
+                className="border-slate-600 text-slate-400 hover:text-white hover:border-slate-500"
+              >
+                <Pause className="w-4 h-4 mr-2" />
+                Interrupt
+              </Button>
+            </motion.div>
+          )}
+
+          {/* Debug Info */}
+          {!conversationActive && (
+            <div className=\"mt-4 text-center\">
+              <p className=\"text-xs text-slate-500 mb-2\">
+                Having trouble? Check browser console for debug info
+              </p>
+              <Button
+                onClick={async () => {
+                  try {
+                    console.log('Testing microphone access...')
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+                    console.log('Microphone test successful')
+                    alert('Microphone access granted! You can now start the conversation.')
+                    stream.getTracks().forEach(track => track.stop())
+                  } catch (error) {
+                    console.error('Microphone test failed:', error)
+                    alert('Microphone access failed: ' + error.message)
+                  }
+                }}
+                variant=\"outline\"
+                size=\"sm\"
+                className=\"text-xs border-slate-600 text-slate-400 hover:text-white hover:border-slate-500\"
+              >
+                Test Microphone
+              </Button>
+            </div>
+          )}
+
+          {/* Conversation Status */}
+          {conversationActive && (
+            <div className="mt-4 text-center">
+              <p className="text-xs text-slate-500">
+                Conversation active • Speak naturally • Interrupt anytime
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export default App
